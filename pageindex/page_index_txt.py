@@ -15,8 +15,10 @@ Handles OCR artifacts like multi-line headings, page markers, and Google Books m
 
 import asyncio
 import json
+import logging
 import os
 import re
+from typing import Optional
 
 try:
     from .page_index_md import generate_summaries_for_structure_md
@@ -28,13 +30,21 @@ try:
         write_node_id,
     )
 except ImportError:
-    from page_index_md import generate_summaries_for_structure_md
-    from utils import (
+    # Fallback for direct script execution and tests
+    from page_index_md import generate_summaries_for_structure_md  # type: ignore[no-redef]
+    from utils import (  # type: ignore[no-redef]
+        count_tokens,
         create_clean_structure_for_description,
         format_structure,
         generate_doc_description,
         write_node_id,
     )
+
+logger = logging.getLogger(__name__)
+
+# Maximum length for structural headings (book/part markers, ordinals)
+# Lines longer than this are assumed to be prose, not standalone headings
+MAX_STRUCTURAL_HEADING_LENGTH = 60
 
 
 # OCR artifacts to skip (lowercase for matching)
@@ -52,6 +62,12 @@ OCR_ARTIFACTS = {
     "copyright",
     "tous droits réservés",
     "all rights reserved",
+    # Translator/editor metadata
+    "traduction complète en français moderne",
+    "langue originale",
+    "date de traduction",
+    "notes du traducteur",
+    "glossaire des termes",
 }
 
 # Patterns for OCR noise
@@ -62,7 +78,24 @@ OCR_NOISE_PATTERNS = [
     r'^\s*\d+\s*,\s*$',  # "123," patterns
     r'^http[s]?://',  # URLs
     r'^ark:/',  # Archive.org identifiers
+    r'^\*\s+',  # Footnote markers
+    r'^source\s*:\s*',  # Source metadata (case-insensitive via re.IGNORECASE)
 ]
+
+
+def is_metadata_line(line: str) -> bool:
+    """Detect metadata key-value pairs like 'Source: ...' or 'Date: ...'."""
+    stripped = line.strip()
+    # Common metadata patterns: "Key: value" at start of line
+    metadata_keys = [
+        'source', 'date', 'translator', 'traducteur', 'author', 'auteur',
+        'editor', 'éditeur', 'publisher', 'éditeur', 'edition', 'édition',
+    ]
+    lower = stripped.lower()
+    for key in metadata_keys:
+        if lower.startswith(f'{key}:') or lower.startswith(f'{key} :'):
+            return True
+    return False
 
 
 def is_ocr_artifact(line: str) -> bool:
@@ -75,9 +108,13 @@ def is_ocr_artifact(line: str) -> bool:
     if stripped in OCR_ARTIFACTS:
         return True
 
+    # Metadata lines (Source: ..., Date: ..., etc.)
+    if is_metadata_line(line):
+        return True
+
     # Pattern matches
     for pattern in OCR_NOISE_PATTERNS:
-        if re.match(pattern, stripped):
+        if re.match(pattern, stripped, re.IGNORECASE):
             return True
 
     # Very short gibberish (OCR errors)
@@ -90,15 +127,17 @@ def is_ocr_artifact(line: str) -> bool:
 def is_all_caps_heading(line: str) -> bool:
     """Check if line is an all-caps heading.
 
-    Supports French accented capitals and common punctuation.
+    Supports French accented capitals and common punctuation including
+    French guillemets («») and curly quotes.
     """
     stripped = line.strip()
     if len(stripped) < 5:
         return False
 
     # Allow uppercase letters (including French accented), spaces, hyphens, common punctuation
-    # Pattern: starts with uppercase, contains mostly uppercase
-    if re.match(r'^[A-ZÀÂÄÉÈÊËÏÎÔÙÛÜÇ][A-ZÀÂÄÉÈÊËÏÎÔÙÛÜÇ\s\-,\.\'\"()]+$', stripped):
+    # Includes «»''""  for French quotation marks and curly quotes
+    # Pattern: starts with uppercase or opening quote, contains mostly uppercase
+    if re.match(r'^[A-ZÀÂÄÉÈÊËÏÎÔÙÛÜÇ«\'""][A-ZÀÂÄÉÈÊËÏÎÔÙÛÜÇ\s\-,\.\'\"()«»''""]+$', stripped):
         return True
 
     return False
@@ -182,7 +221,7 @@ def detect_book_heading(line: str) -> tuple[bool, str, int]:
     upper = stripped.upper()
 
     # Only match if the line is primarily a book/part marker (short and structural)
-    if len(stripped) > 60:  # Too long to be a standalone marker
+    if len(stripped) > MAX_STRUCTURAL_HEADING_LENGTH:
         return False, "", 0
 
     # English ordinals + BOOK/PART
@@ -212,7 +251,7 @@ def detect_ordinal_heading(line: str) -> tuple[bool, str, int]:
     upper = stripped.upper()
 
     # Only match short structural lines
-    if len(stripped) > 60:
+    if len(stripped) > MAX_STRUCTURAL_HEADING_LENGTH:
         return False, "", 0
 
     # French ordinals followed by a noun
@@ -401,8 +440,8 @@ def build_tree_from_nodes(node_list: list[dict]) -> list[dict]:
     if not node_list:
         return []
 
-    stack = []
-    root_nodes = []
+    stack: list[tuple[dict, int]] = []
+    root_nodes: list[dict] = []
     node_counter = 0
 
     for node in node_list:
@@ -433,14 +472,166 @@ def build_tree_from_nodes(node_list: list[dict]) -> list[dict]:
     return root_nodes
 
 
+def txt_to_page_list(
+    txt_content: str,
+    chars_per_page: int = 3000,
+    model: str = "gpt-4o-2024-11-20"
+) -> tuple[list[tuple[str, int]], list[int]]:
+    """Create synthetic page list from text content.
+
+    Splits text on paragraph boundaries (double newlines) and accumulates
+    paragraphs until chars_per_page threshold is reached. This enables
+    PageIndex RAG functions to work with txt files.
+
+    Args:
+        txt_content: The full text content
+        chars_per_page: Target characters per synthetic page (default 3000)
+        model: Model for token counting (default gpt-4o-2024-11-20)
+
+    Returns:
+        Tuple of:
+        - page_list: List of (text_chunk, token_count) tuples
+        - line_to_page: List mapping line number (0-indexed) to page (1-indexed)
+    """
+    if not txt_content:
+        return [], []
+
+    lines = txt_content.split('\n')
+    paragraphs = txt_content.split('\n\n')
+
+    # Build page list by accumulating paragraphs
+    page_list: list[tuple[str, int]] = []
+    current_page_text: list[str] = []
+    current_char_count = 0
+
+    for para in paragraphs:
+        para_stripped = para.strip()
+        if not para_stripped:
+            continue
+
+        para_len = len(para_stripped)
+
+        # Start new page if adding this paragraph exceeds threshold
+        if current_char_count > 0 and current_char_count + para_len > chars_per_page:
+            page_text = '\n\n'.join(current_page_text)
+            token_count = count_tokens(page_text, model=model)
+            page_list.append((page_text, token_count))
+            current_page_text = []
+            current_char_count = 0
+
+        current_page_text.append(para_stripped)
+        current_char_count += para_len
+
+    # Don't forget the last page
+    if current_page_text:
+        page_text = '\n\n'.join(current_page_text)
+        token_count = count_tokens(page_text, model=model)
+        page_list.append((page_text, token_count))
+
+    # Build line-to-page mapping
+    # For each line, find which page it belongs to by position
+    line_to_page = []
+    char_pos = 0
+    page_boundaries = []  # Character positions where each page starts
+
+    # Calculate page boundaries
+    boundary = 0
+    for page_text, _ in page_list:
+        page_boundaries.append(boundary)
+        # Account for paragraph separators we stripped/rejoined
+        boundary += len(page_text) + 2  # +2 for \n\n separator
+
+    # Map each line to its page
+    for line in lines:
+        # Find which page this character position falls into
+        page_num = 1
+        for i, page_boundary in enumerate(page_boundaries):
+            if i + 1 < len(page_boundaries):
+                if page_boundary <= char_pos < page_boundaries[i + 1]:
+                    page_num = i + 1
+                    break
+            else:
+                page_num = len(page_boundaries)
+
+        line_to_page.append(page_num)
+        char_pos += len(line) + 1  # +1 for newline
+
+    return page_list, line_to_page
+
+
+def add_page_indices_to_nodes(
+    tree_structure: list[dict],
+    line_to_page: list[int],
+    total_pages: int
+) -> list[dict]:
+    """Add physical_index, start_index, end_index to nodes.
+
+    These indices enable PageIndex RAG functions like check_title_appearance
+    and add_node_text to work with txt files.
+
+    Args:
+        tree_structure: The tree structure from build_tree_from_nodes
+        line_to_page: Mapping from line number (0-indexed) to page (1-indexed)
+        total_pages: Total number of synthetic pages
+
+    Returns:
+        The tree structure with page indices added to each node
+    """
+    def process_nodes(nodes: list[dict], parent_next_line: Optional[int] = None) -> None:
+        for i, node in enumerate(nodes):
+            line_num = node.get('line_num', 1)
+
+            # Determine physical_index from line number
+            if line_num > 0 and line_num <= len(line_to_page):
+                physical_index = line_to_page[line_num - 1]  # Convert to 0-indexed
+            else:
+                physical_index = 1
+
+            node['physical_index'] = physical_index
+            node['start_index'] = physical_index
+
+            # Determine end_index
+            # Look for next sibling or parent's next sibling
+            if i + 1 < len(nodes):
+                next_line = nodes[i + 1].get('line_num', 1)
+                if next_line > 0 and next_line <= len(line_to_page):
+                    end_page = line_to_page[next_line - 1] - 1
+                    node['end_index'] = max(physical_index, end_page)
+                else:
+                    node['end_index'] = total_pages
+            elif parent_next_line is not None:
+                if parent_next_line > 0 and parent_next_line <= len(line_to_page):
+                    end_page = line_to_page[parent_next_line - 1] - 1
+                    node['end_index'] = max(physical_index, end_page)
+                else:
+                    node['end_index'] = total_pages
+            else:
+                node['end_index'] = total_pages
+
+            # Process children
+            if node.get('nodes'):
+                # Child nodes should end before the next sibling of current node
+                if i + 1 < len(nodes):
+                    child_parent_next = nodes[i + 1].get('line_num')
+                elif parent_next_line:
+                    child_parent_next = parent_next_line
+                else:
+                    child_parent_next = None
+                process_nodes(node['nodes'], child_parent_next)
+
+    process_nodes(tree_structure)
+    return tree_structure
+
+
 async def txt_to_tree(
     txt_path: str,
     if_add_node_summary: str = 'no',
     summary_token_threshold: int = 200,
-    model: str = None,
+    model: Optional[str] = None,
     if_add_doc_description: str = 'no',
     if_add_node_text: str = 'no',
     if_add_node_id: str = 'yes',
+    chars_per_page: int = 3000,
 ) -> dict:
     """Convert a plain text file to a PageIndex tree structure.
 
@@ -450,38 +641,59 @@ async def txt_to_tree(
         summary_token_threshold: Token threshold for summary generation
         model: LLM model to use for summaries
         if_add_doc_description: Whether to generate document description
-        if_add_node_text: Whether to include full text in output
+        if_add_node_text: Whether to include full text in output. When 'yes',
+            also generates synthetic pages and adds page indices to nodes.
         if_add_node_id: Whether to add node IDs
+        chars_per_page: Target characters per synthetic page (default 3000).
+            Only used when if_add_node_text='yes'.
 
     Returns:
-        Dict with 'doc_name' and 'structure' keys
+        Dict with 'doc_name' and 'structure' keys. When if_add_node_text='yes',
+        also includes 'page_list' (list of (text, token_count) tuples) for
+        PageIndex RAG compatibility.
     """
     with open(txt_path, encoding='utf-8', errors='replace') as f:
         txt_content = f.read()
 
-    print("Extracting nodes from text...")
+    logger.info("Extracting nodes from text...")
     node_list, txt_lines = extract_nodes_from_txt(txt_content)
 
-    print(f"Found {len(node_list)} heading nodes")
+    logger.info(f"Found {len(node_list)} heading nodes")
 
     # Show heading type distribution
-    type_counts = {}
+    type_counts: dict[str, int] = {}
     for node in node_list:
         t = node.get('type', 'unknown')
         type_counts[t] = type_counts.get(t, 0) + 1
     if type_counts:
-        print("  Heading types: " + ", ".join(f"{k}={v}" for k, v in sorted(type_counts.items())))
+        logger.info("  Heading types: " + ", ".join(f"{k}={v}" for k, v in sorted(type_counts.items())))
 
-    print("Extracting text content for each node...")
+    logger.info("Extracting text content for each node...")
     nodes_with_content = extract_node_text_content(node_list, txt_lines)
 
-    print("Building tree from nodes...")
+    logger.info("Building tree from nodes...")
     tree_structure = build_tree_from_nodes(nodes_with_content)
+
+    # Generate synthetic pages and add page indices when including node text
+    page_list = None
+    if if_add_node_text == 'yes':
+        logger.info("Generating synthetic pages...")
+        page_list, line_to_page = txt_to_page_list(
+            txt_content,
+            chars_per_page=chars_per_page,
+            model=model or "gpt-4o-2024-11-20"
+        )
+        total_pages = len(page_list)
+        logger.info(f"Created {total_pages} synthetic pages")
+
+        if line_to_page:
+            logger.info("Adding page indices to nodes...")
+            tree_structure = add_page_indices_to_nodes(tree_structure, line_to_page, total_pages)
 
     if if_add_node_id == 'yes':
         write_node_id(tree_structure)
 
-    print("Formatting tree structure...")
+    logger.info("Formatting tree structure...")
 
     if if_add_node_summary == 'yes':
         tree_structure = format_structure(
@@ -489,7 +701,7 @@ async def txt_to_tree(
             order=['title', 'node_id', 'summary', 'prefix_summary', 'text', 'line_num', 'nodes']
         )
 
-        print("Generating summaries for each node...")
+        logger.info("Generating summaries for each node...")
         tree_structure = await generate_summaries_for_structure_md(
             tree_structure,
             summary_token_threshold=summary_token_threshold,
@@ -503,19 +715,22 @@ async def txt_to_tree(
             )
 
         if if_add_doc_description == 'yes':
-            print("Generating document description...")
+            logger.info("Generating document description...")
             clean_structure = create_clean_structure_for_description(tree_structure)
             doc_description = generate_doc_description(clean_structure, model=model)
-            return {
+            result = {
                 'doc_name': os.path.splitext(os.path.basename(txt_path))[0],
                 'doc_description': doc_description,
                 'structure': tree_structure,
             }
+            if page_list is not None:
+                result['page_list'] = page_list
+            return result
     else:
         if if_add_node_text == 'yes':
             tree_structure = format_structure(
                 tree_structure,
-                order=['title', 'node_id', 'text', 'line_num', 'nodes']
+                order=['title', 'node_id', 'text', 'line_num', 'physical_index', 'start_index', 'end_index', 'nodes']
             )
         else:
             tree_structure = format_structure(
@@ -523,10 +738,13 @@ async def txt_to_tree(
                 order=['title', 'node_id', 'line_num', 'nodes']
             )
 
-    return {
+    result = {
         'doc_name': os.path.splitext(os.path.basename(txt_path))[0],
         'structure': tree_structure,
     }
+    if page_list is not None:
+        result['page_list'] = page_list
+    return result
 
 
 if __name__ == "__main__":
