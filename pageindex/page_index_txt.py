@@ -18,7 +18,6 @@ import json
 import logging
 import os
 import re
-from typing import Optional
 
 try:
     from .page_index_md import generate_summaries_for_structure_md
@@ -472,6 +471,36 @@ def build_tree_from_nodes(node_list: list[dict]) -> list[dict]:
     return root_nodes
 
 
+def mark_nodes_for_deferred_summary(tree_structure: list[dict]) -> list[dict]:
+    """Mark nodes with summary prompts for external LLM processing.
+
+    When if_add_node_summary='deferred', nodes are marked with:
+    - 'needs_summary': True
+    - 'summary': None
+    - 'summary_prompt': A prompt for external LLM processing
+
+    This enables Claude Code agents or other external LLM systems to
+    fill in summaries without requiring the openai package.
+    """
+    def mark_node(node: dict) -> dict:
+        if 'text' in node and node['text']:
+            node['needs_summary'] = True
+            node['summary'] = None
+            # Create a prompt for external processing
+            text_preview = node['text'][:2000]
+            if len(node['text']) > 2000:
+                text_preview += '...'
+            node['summary_prompt'] = (
+                f"Generate a concise summary of the following section titled "
+                f"'{node.get('title', 'Untitled')}':\n\n{text_preview}"
+            )
+        if 'nodes' in node:
+            node['nodes'] = [mark_node(child) for child in node['nodes']]
+        return node
+
+    return [mark_node(node) for node in tree_structure]
+
+
 def txt_to_page_list(
     txt_content: str,
     chars_per_page: int = 3000,
@@ -577,7 +606,7 @@ def add_page_indices_to_nodes(
     Returns:
         The tree structure with page indices added to each node
     """
-    def process_nodes(nodes: list[dict], parent_next_line: Optional[int] = None) -> None:
+    def process_nodes(nodes: list[dict], parent_next_line: int | None = None) -> None:
         for i, node in enumerate(nodes):
             line_num = node.get('line_num', 1)
 
@@ -627,7 +656,7 @@ async def txt_to_tree(
     txt_path: str,
     if_add_node_summary: str = 'no',
     summary_token_threshold: int = 200,
-    model: Optional[str] = None,
+    model: str | None = None,
     if_add_doc_description: str = 'no',
     if_add_node_text: str = 'no',
     if_add_node_id: str = 'yes',
@@ -637,7 +666,10 @@ async def txt_to_tree(
 
     Args:
         txt_path: Path to the .txt file
-        if_add_node_summary: Whether to generate LLM summaries for nodes
+        if_add_node_summary: Whether to generate LLM summaries for nodes.
+            'no': No summaries (default)
+            'yes': Generate summaries via LLM (requires LLM provider)
+            'deferred': Mark nodes for external LLM processing (no LLM required)
         summary_token_threshold: Token threshold for summary generation
         model: LLM model to use for summaries
         if_add_doc_description: Whether to generate document description
@@ -650,7 +682,8 @@ async def txt_to_tree(
     Returns:
         Dict with 'doc_name' and 'structure' keys. When if_add_node_text='yes',
         also includes 'page_list' (list of (text, token_count) tuples) for
-        PageIndex RAG compatibility.
+        PageIndex RAG compatibility. When if_add_node_summary='deferred',
+        nodes include 'needs_summary', 'summary', and 'summary_prompt' fields.
     """
     with open(txt_path, encoding='utf-8', errors='replace') as f:
         txt_content = f.read()
@@ -726,6 +759,14 @@ async def txt_to_tree(
             if page_list is not None:
                 result['page_list'] = page_list
             return result
+    elif if_add_node_summary == 'deferred':
+        # Mark nodes for external LLM processing (no LLM calls made here)
+        logger.info("Marking nodes for deferred summary generation...")
+        tree_structure = mark_nodes_for_deferred_summary(tree_structure)
+        tree_structure = format_structure(
+            tree_structure,
+            order=['title', 'node_id', 'needs_summary', 'summary', 'summary_prompt', 'text', 'line_num', 'physical_index', 'start_index', 'end_index', 'nodes']
+        )
     else:
         if if_add_node_text == 'yes':
             tree_structure = format_structure(

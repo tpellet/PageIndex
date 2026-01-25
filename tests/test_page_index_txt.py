@@ -1019,5 +1019,160 @@ The marriage was happy and blessed."""
             assert 1 <= page_num <= len(page_list)
 
 
+class TestDeferredSummaryMode:
+    """Tests for deferred summary mode (if_add_node_summary='deferred')."""
+
+    @pytest.fixture
+    def sample_book_file(self, tmp_path):
+        """Create a sample book file for testing."""
+        content = """FIRST BOOK
+
+THE LIFE OF THE KING
+
+This is the introduction to the first book.
+It describes the early life of the king.
+
+CHAPTER I
+
+The birth of the king occurred in a small village.
+The people rejoiced at his arrival.
+
+CHAPTER II
+
+The king grew wise and just.
+His reign brought peace to the land."""
+
+        book_file = tmp_path / "sample_book.txt"
+        book_file.write_text(content, encoding='utf-8')
+        return str(book_file)
+
+    def test_mark_nodes_for_deferred_summary_sets_fields(self):
+        """mark_nodes_for_deferred_summary adds needs_summary, summary, summary_prompt."""
+        from page_index_txt import mark_nodes_for_deferred_summary
+
+        tree = [
+            {'title': 'Chapter 1', 'text': 'Some content here.', 'nodes': []},
+        ]
+
+        result = mark_nodes_for_deferred_summary(tree)
+
+        assert result[0]['needs_summary'] is True
+        assert result[0]['summary'] is None
+        assert 'summary_prompt' in result[0]
+
+    def test_mark_nodes_summary_prompt_contains_title(self):
+        """Summary prompt includes the node title."""
+        from page_index_txt import mark_nodes_for_deferred_summary
+
+        tree = [
+            {'title': 'The Great Battle', 'text': 'Content here.', 'nodes': []},
+        ]
+
+        result = mark_nodes_for_deferred_summary(tree)
+
+        assert 'The Great Battle' in result[0]['summary_prompt']
+
+    def test_mark_nodes_summary_prompt_contains_text_preview(self):
+        """Summary prompt includes text preview."""
+        from page_index_txt import mark_nodes_for_deferred_summary
+
+        tree = [
+            {'title': 'Chapter', 'text': 'The king went to war.', 'nodes': []},
+        ]
+
+        result = mark_nodes_for_deferred_summary(tree)
+
+        assert 'The king went to war.' in result[0]['summary_prompt']
+
+    def test_mark_nodes_truncates_long_text(self):
+        """Long text is truncated to 2000 chars with ellipsis."""
+        from page_index_txt import mark_nodes_for_deferred_summary
+
+        long_text = 'x' * 3000
+        tree = [
+            {'title': 'Chapter', 'text': long_text, 'nodes': []},
+        ]
+
+        result = mark_nodes_for_deferred_summary(tree)
+
+        assert len(result[0]['summary_prompt']) < len(long_text) + 200
+        assert '...' in result[0]['summary_prompt']
+
+    def test_mark_nodes_skips_empty_text(self):
+        """Nodes without text don't get summary fields."""
+        from page_index_txt import mark_nodes_for_deferred_summary
+
+        tree = [
+            {'title': 'Empty', 'text': '', 'nodes': []},
+            {'title': 'No text field', 'nodes': []},
+        ]
+
+        result = mark_nodes_for_deferred_summary(tree)
+
+        assert 'needs_summary' not in result[0]
+        assert 'needs_summary' not in result[1]
+
+    def test_mark_nodes_processes_nested_children(self):
+        """Nested child nodes are also marked."""
+        from page_index_txt import mark_nodes_for_deferred_summary
+
+        tree = [
+            {
+                'title': 'Book 1',
+                'text': 'Book content',
+                'nodes': [
+                    {'title': 'Chapter 1', 'text': 'Chapter content', 'nodes': []},
+                ],
+            },
+        ]
+
+        result = mark_nodes_for_deferred_summary(tree)
+
+        assert result[0]['needs_summary'] is True
+        assert result[0]['nodes'][0]['needs_summary'] is True
+
+    @pytest.mark.asyncio
+    async def test_txt_to_tree_deferred_mode(self, sample_book_file):
+        """txt_to_tree with if_add_node_summary='deferred' marks nodes."""
+        from page_index_txt import txt_to_tree
+
+        result = await txt_to_tree(
+            sample_book_file,
+            if_add_node_summary='deferred',
+            if_add_node_text='yes',
+        )
+
+        # Check that nodes have deferred summary fields
+        def check_deferred_fields(node):
+            if node.get('text'):
+                assert 'needs_summary' in node
+                assert node['needs_summary'] is True
+                assert node['summary'] is None
+                assert 'summary_prompt' in node
+            for child in node.get('nodes', []):
+                check_deferred_fields(child)
+
+        for node in result['structure']:
+            check_deferred_fields(node)
+
+    @pytest.mark.asyncio
+    async def test_txt_to_tree_deferred_no_llm_calls(self, sample_book_file):
+        """Deferred mode doesn't make any LLM calls."""
+        from page_index_txt import txt_to_tree
+
+        # This should complete without any external dependencies
+        # If it tried to call LLM, it would fail since we haven't
+        # configured any provider
+        result = await txt_to_tree(
+            sample_book_file,
+            if_add_node_summary='deferred',
+            if_add_node_text='yes',
+        )
+
+        # Just verify it returned something
+        assert 'structure' in result
+        assert len(result['structure']) > 0
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

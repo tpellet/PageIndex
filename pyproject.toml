@@ -23,11 +23,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "openai>=1.0",
-    "pymupdf>=1.20",
-    "PyPDF2>=3.0",
     "python-dotenv>=1.0",
-    "tiktoken>=0.5",
     "pyyaml>=6.0",
 ]
 
@@ -36,6 +32,20 @@ Repository = "https://github.com/tpellet/PageIndex"
 "Original Project" = "https://github.com/VectifyAI/PageIndex"
 
 [project.optional-dependencies]
+# PDF parsing support
+pdf = ["pymupdf>=1.20", "PyPDF2>=3.0"]
+# OpenAI provider with token counting
+openai = ["openai>=1.0", "tiktoken>=0.5"]
+# Anthropic/Claude provider
+anthropic = ["anthropic>=0.30"]
+# All optional dependencies
+all = [
+    "pymupdf>=1.20",
+    "PyPDF2>=3.0",
+    "openai>=1.0",
+    "tiktoken>=0.5",
+    "anthropic>=0.30",
+]
 dev = [
     "pytest>=9.0",
     "pytest-asyncio>=0.23",
