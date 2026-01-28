@@ -2,9 +2,11 @@
 from .llm_provider import (
     AnthropicProvider,
     CallbackProvider,
+    ClaudeCodeProvider,
     LLMProvider,
     OpenAIProvider,
     get_llm_provider,
+    is_claude_code_available,
     set_llm_provider,
 )
 from .page_index import *
@@ -20,6 +22,8 @@ __all__ = [
     "OpenAIProvider",
     "AnthropicProvider",
     "CallbackProvider",
+    "ClaudeCodeProvider",
     "set_llm_provider",
     "get_llm_provider",
+    "is_claude_code_available",
 ]
